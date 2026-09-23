@@ -1,0 +1,877 @@
+openapi: 3.0.1
+info:
+  title: Checkout reactivo sobre R2DBC
+  description: |-
+    Órdenes de compra reactivas: reserva atómica de stock con saga de compensación,
+    servicios externos en paralelo (precio, impuesto, antifraude), confirmación,
+    streams SSE por orden y de tablero, reportes NDJSON y carga masiva de productos.
+
+    Estados de la orden: PENDIENTE → RESERVADA → CONFIRMADA. Terminales adicionales:
+    RECHAZADA (riesgo alto), COMPENSADA (fallo en la reserva), EXPIRADA (TTL vencido).
+
+    Errores: 400 ValidacionException · 404 ProductoNoExisteException /
+    OrdenNoExisteException · 409 StockInsuficienteException / EstadoInvalidoException ·
+    422 RiesgoAltoException. Todos devuelven { correlationId, timestamp, message, error }.
+  contact:
+    name: Equipo demo
+  license:
+    name: Uso interno
+  version: 1.0.0
+servers:
+- url: http://localhost:8081
+  description: Local
+tags:
+- name: Órdenes
+  description: "Alta, consulta, confirmación y stream SSE de órdenes"
+- name: Tablero
+  description: Stream SSE global compartido (hot publisher)
+- name: Reportes
+  description: Ventas por categoría en JSON y acumulado NDJSON
+- name: Productos
+  description: Catálogo y carga masiva NDJSON con upsert
+- name: Clientes
+  description: CRUD reactivo de la demo previa
+- name: Órdenes (demo CRUD)
+  description: Entidad `ordenes` de la demo previa
+- name: Simulador externo
+  description: "Controla fallos, latencia y riesgo de los servicios simulados"
+paths:
+  /external/simulator:
+    get:
+      tags:
+      - Simulador externo
+      summary: Configuración actual del simulador
+      operationId: actual
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/SimuladorConfig"
+    put:
+      tags:
+      - Simulador externo
+      summary: "Ajusta fallos de precio, latencia de antifraude y riesgo forzado"
+      operationId: configurar
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SimuladorConfig"
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/SimuladorConfig"
+    delete:
+      tags:
+      - Simulador externo
+      summary: Restaura el simulador a los valores por defecto
+      operationId: reset
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/SimuladorConfig"
+  /external/fraud:
+    post:
+      tags:
+      - Simulador externo
+      summary: Score antifraude simulado (puede tardar más que el timeout)
+      operationId: fraud
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties:
+                type: object
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: integer
+                format: int32
+  /api/products:
+    get:
+      tags:
+      - Productos
+      operationId: all
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Producto"
+    post:
+      tags:
+      - Productos
+      operationId: create
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Producto"
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/Producto"
+  /api/products/bulk:
+    post:
+      tags:
+      - Productos
+      summary: Carga masiva de productos (NDJSON)
+      description: Un JSON por línea. Se procesa en lotes de 500 con INSERT ... ON
+        CONFLICT DO UPDATE.
+      operationId: bulk
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      requestBody:
+        content:
+          application/x-ndjson:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/Producto"
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/ResultadoCarga"
+  /api/orders:
+    post:
+      tags:
+      - Órdenes
+      summary: Crea una orden y reserva stock
+      description: "Persiste la orden, reserva stock por ítem con UPDATE ... RETURNING,\
+        \ consulta precio, impuesto y antifraude en paralelo y deja la orden en RESERVADA.\
+        \ Si algo falla, compensa."
+      operationId: crear
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        description: Repetir la misma clave devuelve la orden original sin descontar
+          stock de nuevo
+        required: false
+        schema:
+          type: string
+        example: K1
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CrearOrdenRequest"
+        required: true
+      responses:
+        "201":
+          description: Orden creada en estado RESERVADA
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+        "400":
+          description: Petición inválida (ValidacionException)
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+        "404":
+          description: Algún producto no existe (ProductoNoExisteException)
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+        "409":
+          description: Stock insuficiente (StockInsuficienteException)
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+        "422":
+          description: "Riesgo alto: reserva liberada (RiesgoAltoException)"
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+  /api/orders/{id}/confirm:
+    post:
+      tags:
+      - Órdenes
+      summary: "Confirma la orden: el stock reservado pasa a vendido"
+      operationId: confirmar
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: Orden CONFIRMADA
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+        "404":
+          description: OrdenNoExisteException
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+        "409":
+          description: La orden no está RESERVADA (EstadoInvalidoException)
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+  /api/ordenes:
+    get:
+      tags:
+      - Órdenes (demo CRUD)
+      operationId: getAllOrdenes
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Orden"
+    post:
+      tags:
+      - Órdenes (demo CRUD)
+      operationId: saveOrden
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Orden"
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/Orden"
+  /api/clientes:
+    get:
+      tags:
+      - Clientes
+      operationId: getAllClientes
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Cliente"
+    post:
+      tags:
+      - Clientes
+      operationId: guardarCliente
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Cliente"
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/Cliente"
+  /external/tax/{region}:
+    get:
+      tags:
+      - Simulador externo
+      summary: "Tasa de impuesto por región (lenta, se cachea 10 min en el cliente)"
+      operationId: tax
+      parameters:
+      - name: region
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: number
+                format: double
+  /external/pricing/{id}:
+    get:
+      tags:
+      - Simulador externo
+      summary: Precio dinámico simulado (catálogo × 1.10)
+      operationId: pricing
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/CotizacionPrecio"
+  /api/reports/sales/stream:
+    get:
+      tags:
+      - Reportes
+      summary: Total acumulado en vivo (NDJSON)
+      description: "Un objeto por línea con el acumulado (scan). Respuesta infinita:\
+        \ cerrar el cliente para terminar."
+      operationId: ventasStream
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            application/x-ndjson:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TotalCategoria"
+  /api/reports/sales:
+    get:
+      tags:
+      - Reportes
+      summary: Ventas por categoría
+      description: Agrega los ítems de las órdenes CONFIRMADAS respetando backpressure
+        (limitRate).
+      operationId: ventas
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TotalCategoria"
+  /api/products/{id}:
+    get:
+      tags:
+      - Productos
+      operationId: byId
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/Producto"
+  /api/products/stream:
+    get:
+      tags:
+      - Productos
+      operationId: stream
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            text/event-stream:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Producto"
+  /api/orders/{id}:
+    get:
+      tags:
+      - Órdenes
+      summary: Consulta una orden con sus ítems
+      operationId: obtener
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "404":
+          description: OrdenNoExisteException
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/OrdenCompra"
+  /api/orders/{id}/events:
+    get:
+      tags:
+      - Órdenes
+      summary: Stream SSE de una orden
+      description: Emite el estado actual y los cambios posteriores; cierra al llegar
+        a un estado terminal.
+      operationId: eventos
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            text/event-stream:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ServerSentEventEventoOrden"
+  /api/ordenes/cliente/{clienteId}:
+    get:
+      tags:
+      - Órdenes (demo CRUD)
+      operationId: getOrdenesByClienteId
+      parameters:
+      - name: clienteId
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Orden"
+  /api/ops/dashboard:
+    get:
+      tags:
+      - Tablero
+      summary: Stream SSE global de eventos
+      description: "Publisher caliente compartido entre todos los suscriptores, con\
+        \ heartbeat periódico."
+      operationId: dashboard
+      parameters:
+      - name: X-Correlation-Id
+        in: header
+        description: "Id de correlación propagado por Reactor Context hasta los logs\
+          \ y los errores. Si no se envía, la app genera uno y lo devuelve en la respuesta."
+        required: false
+        schema:
+          type: string
+        example: demo-1
+      responses:
+        "200":
+          description: OK
+          content:
+            text/event-stream:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ServerSentEventEventoTablero"
+components:
+  schemas:
+    SimuladorConfig:
+      type: object
+      properties:
+        pricingFailures:
+          type: integer
+          format: int32
+        fraudDelayMs:
+          type: integer
+          format: int64
+        forcedRiskScore:
+          type: integer
+          format: int32
+    Producto:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        price:
+          type: number
+          format: double
+        stock:
+          type: integer
+          format: int32
+        category:
+          type: string
+        reserved:
+          type: integer
+          format: int32
+    ResultadoCarga:
+      type: object
+      properties:
+        guardados:
+          type: integer
+          format: int32
+        fallidos:
+          type: integer
+          format: int32
+    CrearOrdenRequest:
+      type: object
+      properties:
+        clienteId:
+          type: integer
+          format: int64
+        region:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Item"
+    Item:
+      type: object
+      properties:
+        productoId:
+          type: integer
+          format: int64
+        cantidad:
+          type: integer
+          format: int32
+    ItemOrden:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        ordenId:
+          type: integer
+          format: int64
+        productoId:
+          type: integer
+          format: int64
+        categoria:
+          type: string
+        cantidad:
+          type: integer
+          format: int32
+        precioUnitario:
+          type: number
+          format: double
+    OrdenCompra:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        clienteId:
+          type: integer
+          format: int64
+        region:
+          type: string
+        idempotencyKey:
+          type: string
+        estado:
+          type: string
+          enum:
+          - PENDIENTE
+          - RESERVADA
+          - CONFIRMADA
+          - RECHAZADA
+          - EXPIRADA
+          - COMPENSADA
+        subtotal:
+          type: number
+          format: double
+        impuesto:
+          type: number
+          format: double
+        total:
+          type: number
+          format: double
+        riskScore:
+          type: integer
+          format: int32
+        creadoEn:
+          type: string
+          format: date-time
+        expiraEn:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ItemOrden"
+    Orden:
+      required:
+      - descripcion
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        descripcion:
+          minLength: 1
+          type: string
+        clienteId:
+          type: integer
+          format: int64
+    Cliente:
+      required:
+      - email
+      - nombre
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        nombre:
+          minLength: 1
+          type: string
+        email:
+          minLength: 1
+          type: string
+          format: email
+    CotizacionPrecio:
+      type: object
+      properties:
+        productoId:
+          type: integer
+          format: int64
+        precioUnitario:
+          type: number
+          format: double
+        fuente:
+          type: string
+    TotalCategoria:
+      type: object
+      properties:
+        categoria:
+          type: string
+        unidades:
+          type: integer
+          format: int64
+        monto:
+          type: number
+          format: double
+    ServerSentEventEventoOrden:
+      type: object
+    ServerSentEventEventoTablero:
+      type: object

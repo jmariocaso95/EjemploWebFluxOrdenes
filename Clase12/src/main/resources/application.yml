@@ -1,0 +1,37 @@
+spring:
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/testdb
+    username: postgres
+    password: ${POSTGRES_PASSWORD:postgres}   # alineado con docker-compose.yml
+  sql:
+    init:
+      mode: always
+
+server:
+  port: 8081
+
+app:
+  external:
+    base-url: http://localhost:8081     # el simulador vive en la misma app
+    pricing-timeout: 2s
+    fraud-timeout: 800ms
+  reservation-ttl: 2m
+  expiry-interval: 30s
+  risk-threshold: 80
+  default-risk-score: 50
+  low-stock-threshold: 5
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs          # JSON; el YAML sale en /v3/api-docs.yaml
+    version: openapi_3_0        # 3.0.1: lo importan Postman, Insomnia y los generadores viejos
+                                # cambiar a openapi_3_1 si se prefiere la última versión
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+
+logging:
+  level:
+    com.example.demo: INFO
+    org.springframework.r2dbc.core: DEBUG    # muestra el SQL emitido

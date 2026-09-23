@@ -1,0 +1,73 @@
+plugins {
+	id 'java'
+	id 'org.springframework.boot' version '4.1.1'
+	id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.example'
+version = '0.0.1-SNAPSHOT'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+}
+
+repositories {
+	mavenCentral()
+}
+
+dependencies {
+	implementation 'org.springframework.boot:spring-boot-starter-webflux'
+	implementation 'org.springframework.boot:spring-boot-starter-data-r2dbc'
+	implementation 'org.springframework.boot:spring-boot-starter-validation'
+	implementation 'org.springdoc:springdoc-openapi-starter-webflux-ui:3.0.0'
+	implementation 'org.postgresql:r2dbc-postgresql'
+	runtimeOnly 'org.postgresql:postgresql'          // solo para spring.sql.init (schema.sql)
+
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	testImplementation 'org.springframework.boot:spring-boot-starter-webflux-test'
+	testImplementation 'io.projectreactor:reactor-test'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+	useJUnitPlatform()
+}
+
+/**
+ * Exporta el contrato a docs/openapi.json y docs/openapi.yaml levantando la app un momento.
+ * Uso: ./gradlew exportOpenApi     (requiere Postgres arriba: ./scripts/db.sh up)
+ */
+tasks.register('exportOpenApi') {
+	group = 'documentation'
+	description = 'Arranca la app, descarga /v3/api-docs y guarda docs/openapi.json + docs/openapi.yaml'
+	dependsOn 'bootJar'
+	doLast {
+		def jar = tasks.bootJar.archiveFile.get().asFile
+		def port = 18099
+		def out = file('docs'); out.mkdirs()
+		def proc = new ProcessBuilder('java', '-jar', jar.absolutePath,
+				"--server.port=${port}", "--app.external.base-url=http://localhost:${port}",
+				'--app.expiry-interval=PT1H', '--logging.level.root=WARN')
+				.redirectErrorStream(true).start()
+		def log = new StringBuilder()
+		Thread.startDaemon { proc.inputStream.eachLine { log.append(it).append('\n') } }
+		try {
+			def ready = false
+			for (int i = 0; i < 90 && !ready; i++) {
+				try {
+					new URL("http://localhost:${port}/v3/api-docs").text
+					ready = true
+				} catch (ignored) { Thread.sleep(1000) }
+			}
+			if (!ready) throw new GradleException("La app no expuso /v3/api-docs. ¿Postgres arriba? Log:\n${log}")
+			file('docs/openapi.json').text = new URL("http://localhost:${port}/v3/api-docs").text
+			file('docs/openapi.yaml').text = new URL("http://localhost:${port}/v3/api-docs.yaml").text
+			logger.lifecycle("OpenAPI exportado a docs/openapi.json y docs/openapi.yaml")
+		} finally {
+			proc.destroy()
+			proc.waitFor(20, java.util.concurrent.TimeUnit.SECONDS)
+		}
+	}
+}

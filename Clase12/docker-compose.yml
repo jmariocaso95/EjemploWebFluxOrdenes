@@ -1,0 +1,22 @@
+# Compatible con podman-compose y con docker compose.
+# Con podman:  podman-compose up -d      (o: ./scripts/db.sh up)
+services:
+  postgres:
+    image: docker.io/library/postgres:15   # registro explícito: podman no asume docker.io
+    container_name: postgres_r2dbc
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
